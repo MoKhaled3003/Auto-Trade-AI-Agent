@@ -64,6 +64,9 @@ export class AlpacaBroker {
   isReady(): boolean { return this.connected; }
   isLive():  boolean { return this.connected && this.autoTrade; }
 
+  /** Return the underlying Alpaca SDK client (for data feed reuse). */
+  getDataClient(): any { return this.client; }
+
   // ── Account ───────────────────────────────────────────────────────────────
 
   async printAccountAtStartup(): Promise<void> {

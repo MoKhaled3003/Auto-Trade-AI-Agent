@@ -63,15 +63,22 @@ export class TradeTracker {
 
     // Already have an open position on this ticker? One at a time.
     if (existing && existing.status !== 'CLOSED') {
+      console.log(chalk.gray(`  ⏭  [${setup.ticker}] setup rejected — already have an open position on this ticker`));
       return false;
     }
 
     // Daily cap
-    if (this.trades.length >= this.maxPerDay) return false;
+    if (this.trades.length >= this.maxPerDay) {
+      console.log(chalk.gray(`  ⏭  [${setup.ticker}] setup rejected — daily trade cap ${this.maxPerDay} reached`));
+      return false;
+    }
 
     // Concurrent cap
     const openCount = [...this.positions.values()].filter(p => p.status === 'WATCHING' || p.status === 'ENTERED').length;
-    if (openCount >= this.maxConcurrent) return false;
+    if (openCount >= this.maxConcurrent) {
+      console.log(chalk.gray(`  ⏭  [${setup.ticker}] setup rejected — concurrent cap ${this.maxConcurrent} reached (raise MAX_CONCURRENT)`));
+      return false;
+    }
 
     const shares = setup.positionSizing?.sharesForTarget ?? 1;
     const tp     = setup.takeProfits[0].price;
