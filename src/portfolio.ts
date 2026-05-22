@@ -2,6 +2,7 @@ import chalk from 'chalk';
 import fs from 'fs';
 import path from 'path';
 import { winstonLogger } from './logger';
+import { AlpacaBroker } from './alpaca-broker';
 
 export interface PortfolioPosition {
   ticker:            string;
@@ -20,18 +21,33 @@ export interface PortfolioPosition {
   realizedPnL?:      number;
   closedAt?:         number;
   exitReason?:       'STOP' | 'TP1' | 'TP2' | 'TRAIL';
+
+  // Was this position auto-synced from Alpaca, or manually entered in the file?
+  source?:           'alpaca' | 'file';
 }
 
 interface PortfolioFile {
-  positions: PortfolioPosition[];
+  // Optional per-ticker SL/TP overrides — applied when Alpaca sync adopts a position
+  overrides?: Array<Partial<PortfolioPosition> & { ticker: string }>;
+  // Legacy: full position records (still loadable for backwards compatibility)
+  positions?: PortfolioPosition[];
 }
 
 const HOLD_LOG_THROTTLE_MS = 2 * 60 * 1000;   // one hold-status line per 2 min per ticker
+const SYNC_INTERVAL_MS     = 30_000;          // re-pull Alpaca positions every 30s
+
+// Default SL/TP percentages when Alpaca position has no override
+const DEFAULT_STOP_PCT = parseFloat(process.env.DEFAULT_STOP_PCT ?? '0.03');   // 3%
+const DEFAULT_TP1_PCT  = parseFloat(process.env.DEFAULT_TP1_PCT  ?? '0.03');   // 3%
+const DEFAULT_TP2_PCT  = parseFloat(process.env.DEFAULT_TP2_PCT  ?? '0.06');   // 6%
 
 export class PortfolioManager {
   private filePath: string;
   private positions: PortfolioPosition[] = [];
+  private overrides: Map<string, Partial<PortfolioPosition>> = new Map();
   private lastHoldLog = new Map<string, number>();
+  private broker:  AlpacaBroker | null = null;
+  private syncTimer: NodeJS.Timeout | null = null;
 
   constructor(filePath: string) {
     this.filePath = path.resolve(filePath);
@@ -41,17 +57,29 @@ export class PortfolioManager {
 
   load(): void {
     if (!fs.existsSync(this.filePath)) {
-      console.log(chalk.gray(`📂 No portfolio file at ${this.filePath} — starting empty.`));
+      console.log(chalk.gray(`📂 No portfolio file at ${this.filePath} — Alpaca is the only source.`));
       return;
     }
     try {
       const raw = fs.readFileSync(this.filePath, 'utf8');
       const obj: PortfolioFile = JSON.parse(raw);
+
+      // Index any user-specified SL/TP overrides
+      for (const o of obj.overrides ?? []) {
+        this.overrides.set(o.ticker, o);
+      }
+      if (this.overrides.size > 0) {
+        console.log(chalk.gray(`📂 Loaded ${this.overrides.size} SL/TP overrides from ${path.basename(this.filePath)}`));
+      }
+
+      // Backwards compatibility — keep legacy full positions if present.
+      // These get merged with Alpaca positions on sync.
       this.positions = (obj.positions ?? []).map(p => ({
         status: 'OPEN',
         breakevenMoved: false,
         tp1Hit: false,
         tp2Hit: false,
+        source: 'file',
         ...p,
       }));
       console.log(chalk.bold.white(`📂 Portfolio loaded: ${this.positions.length} positions`));
@@ -69,6 +97,84 @@ export class PortfolioManager {
       console.log();
     } catch (err) {
       console.error(chalk.red(`Portfolio load failed: ${err instanceof Error ? err.message : err}`));
+    }
+  }
+
+  /**
+   * Connect to Alpaca and treat IT as the source of truth for positions.
+   * Re-syncs every SYNC_INTERVAL_MS so positions opened/closed on the
+   * Alpaca dashboard (outside the agent) are picked up automatically.
+   */
+  async startBrokerSync(broker: AlpacaBroker): Promise<void> {
+    this.broker = broker;
+    if (!broker.isReady()) {
+      console.log(chalk.gray('   PortfolioManager: broker not ready — sync disabled.'));
+      return;
+    }
+    await this._syncOnce();
+    this.syncTimer = setInterval(() => this._syncOnce().catch(() => {}), SYNC_INTERVAL_MS);
+    console.log(chalk.gray(`   PortfolioManager: auto-syncing from Alpaca every ${SYNC_INTERVAL_MS / 1000}s`));
+  }
+
+  stopBrokerSync(): void {
+    if (this.syncTimer) { clearInterval(this.syncTimer); this.syncTimer = null; }
+  }
+
+  private async _syncOnce(): Promise<void> {
+    if (!this.broker) return;
+    const live = await this.broker.getPositions();
+    const liveByTicker = new Map(live.map(p => [p.ticker, p]));
+
+    // 1. Update existing OPEN positions or detect closes
+    for (const pos of this.positions) {
+      if (pos.status === 'CLOSED') continue;
+      if (pos.source === 'file') continue;     // hand-managed entries don't auto-close
+      const livePos = liveByTicker.get(pos.ticker);
+      if (!livePos) {
+        // Position is gone from Alpaca → closed
+        pos.status   = 'CLOSED';
+        pos.closedAt = Date.now();
+        console.log(chalk.gray(`   📂 ${pos.ticker} closed externally (no longer on Alpaca) — marked CLOSED`));
+        winstonLogger.info({ event: 'PORTFOLIO_EXTERNAL_CLOSE', ticker: pos.ticker });
+      } else {
+        // Qty change? Re-base
+        if (Math.abs(livePos.qty - pos.qty) > 0) {
+          pos.qty               = livePos.qty;
+          pos.averageEntryPrice = livePos.avgEntryPx;
+        }
+        liveByTicker.delete(pos.ticker);
+      }
+    }
+
+    // 2. Anything left in liveByTicker is a NEW position we didn't know about
+    for (const [ticker, lp] of liveByTicker.entries()) {
+      const override = this.overrides.get(ticker) ?? {};
+      const entry    = lp.avgEntryPx;
+      const isLong   = lp.side === 'long';
+      const stopLoss    = override.stopLoss    ?? round2(isLong ? entry * (1 - DEFAULT_STOP_PCT) : entry * (1 + DEFAULT_STOP_PCT));
+      const takeProfit1 = override.takeProfit1 ?? round2(isLong ? entry * (1 + DEFAULT_TP1_PCT)  : entry * (1 - DEFAULT_TP1_PCT));
+      const takeProfit2 = override.takeProfit2 ?? round2(isLong ? entry * (1 + DEFAULT_TP2_PCT)  : entry * (1 - DEFAULT_TP2_PCT));
+      const newPos: PortfolioPosition = {
+        ticker,
+        direction:          lp.side,
+        qty:                lp.qty,
+        averageEntryPrice:  entry,
+        stopLoss,
+        takeProfit1,
+        takeProfit2,
+        status:             'OPEN',
+        breakevenMoved:     false,
+        tp1Hit:             false,
+        tp2Hit:             false,
+        source:             'alpaca',
+      };
+      this.positions.push(newPos);
+      const dir = isLong ? '▲ LONG' : '▼ SHORT';
+      console.log(chalk.cyan(
+        `   📂 Adopted ${ticker} ${dir} ${lp.qty}sh @ $${entry.toFixed(2)}` +
+        chalk.gray(`  | SL $${stopLoss.toFixed(2)} | TP1 $${takeProfit1.toFixed(2)} | TP2 $${takeProfit2.toFixed(2)}` +
+                   (override.stopLoss ? '  (overrides applied)' : '  (defaults)'))
+      ));
     }
   }
 
@@ -266,4 +372,8 @@ export class PortfolioManager {
     }
     console.log(chalk.gray('═'.repeat(60)) + '\n');
   }
+}
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
 }

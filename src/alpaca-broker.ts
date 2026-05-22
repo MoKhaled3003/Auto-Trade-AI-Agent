@@ -67,6 +67,23 @@ export class AlpacaBroker {
   /** Return the underlying Alpaca SDK client (for data feed reuse). */
   getDataClient(): any { return this.client; }
 
+  /** Cheap latest-price fetch via direct REST (SDK batch methods are buggy). */
+  private async _fetchLatestPrice(ticker: string): Promise<number | null> {
+    try {
+      const url = `https://data.alpaca.markets/v2/stocks/trades/latest?symbols=${encodeURIComponent(ticker)}&feed=iex`;
+      const res = await fetch(url, {
+        headers: {
+          'APCA-API-KEY-ID':     process.env.ALPACA_PAPER_KEY_ID     ?? '',
+          'APCA-API-SECRET-KEY': process.env.ALPACA_PAPER_SECRET_KEY ?? '',
+        },
+      });
+      if (!res.ok) return null;
+      const body = await res.json() as any;
+      const trade = body?.trades?.[ticker];
+      return trade ? Number(trade.p ?? trade.Price) || null : null;
+    } catch { return null; }
+  }
+
   // ── Account ───────────────────────────────────────────────────────────────
 
   async printAccountAtStartup(): Promise<void> {
@@ -120,8 +137,55 @@ export class AlpacaBroker {
    */
   async submitBracketOrder(req: OrderSubmission): Promise<string | null> {
     if (!this.connected) return null;
+
+    // 🕌 Sharia compliance — never submit a short order. Long-only spot trading.
+    const shariaCompliant = (process.env.SHARIA_COMPLIANT ?? 'true').toLowerCase() === 'true';
+    if (shariaCompliant && req.direction === 'short') {
+      console.log(chalk.gray(
+        `  🕌 [${req.ticker}] short order refused at broker (Sharia mode is on)`
+      ));
+      return null;
+    }
+
     const side    = req.direction === 'long' ? 'buy' : 'sell';
     const session = getSessionState();
+
+    // ── Sanity-check TP / SL against the current market quote ──────────────
+    // RTH brackets fill at the CURRENT market price, not entryIdeal — so
+    // TP must already be on the correct side of "now" or Alpaca rejects.
+    try {
+      const live = await this._fetchLatestPrice(req.ticker);
+      if (live && live > 0) {
+        const buffer = Math.max(0.05, live * 0.001);
+        if (req.direction === 'long') {
+          if (req.takeProfit <= live + buffer) {
+            console.log(chalk.gray(
+              `  ⏭  [${req.ticker}] order skipped — TP $${req.takeProfit.toFixed(2)} not above current $${live.toFixed(2)} (entry zone is below market — wait for pullback)`
+            ));
+            return null;
+          }
+          if (req.stopLoss >= live - buffer) {
+            console.log(chalk.gray(
+              `  ⏭  [${req.ticker}] order skipped — SL $${req.stopLoss.toFixed(2)} not below current $${live.toFixed(2)}`
+            ));
+            return null;
+          }
+        } else {
+          if (req.takeProfit >= live - buffer) {
+            console.log(chalk.gray(
+              `  ⏭  [${req.ticker}] order skipped — TP $${req.takeProfit.toFixed(2)} not below current $${live.toFixed(2)}`
+            ));
+            return null;
+          }
+          if (req.stopLoss <= live + buffer) {
+            console.log(chalk.gray(
+              `  ⏭  [${req.ticker}] order skipped — SL $${req.stopLoss.toFixed(2)} not above current $${live.toFixed(2)}`
+            ));
+            return null;
+          }
+        }
+      }
+    } catch { /* if quote fetch fails, let Alpaca decide */ }
 
     let body: any;
     let tag: string;
@@ -260,21 +324,30 @@ export class AlpacaBroker {
     const msg     = err instanceof Error ? err.message : String(err);
     const status  = (err as any)?.response?.status;
     const respBody = (err as any)?.response?.data;
+    const code    = respBody?.code;
 
     let tag = '❌';
     let advice = '';
-    if (status === 401 || status === 403) {
-      tag = '🔑';
-      advice = ' (check your API keys)';
+
+    // Specific Alpaca error codes (more accurate than HTTP status)
+    if (code === 40310000) {
+      tag = '🔀'; advice = ' (direction conflict — you already hold this ticker on the opposite side)';
+    } else if (code === 40310100) {
+      tag = '💸'; advice = ' (insufficient buying power)';
+    } else if (code === 40010001) {
+      tag = '⛔'; advice = ' (asset not tradable / not available for this account)';
+    } else if (code === 40310003) {
+      tag = '🌙'; advice = ' (extended-hours order, but ticker not in overnight list)';
+    }
+    // Fall back to HTTP status interpretation
+    else if (status === 401 || status === 403) {
+      tag = '🔑'; advice = ' (check your API keys OR this may be a code 40310000 conflict)';
     } else if (status === 422) {
-      tag = '⚠️';
-      advice = ' (rejected — likely market closed, PDT rule, or insufficient buying power)';
+      tag = '⚠️'; advice = ' (rejected — likely market closed, PDT rule, or insufficient buying power)';
     } else if (status === 429) {
-      tag = '⏱️';
-      advice = ' (rate limited — backing off)';
+      tag = '⏱️'; advice = ' (rate limited — backing off)';
     } else if (status >= 500) {
-      tag = '☁️';
-      advice = ' (Alpaca server hiccup)';
+      tag = '☁️'; advice = ' (Alpaca server hiccup)';
     }
 
     console.log(

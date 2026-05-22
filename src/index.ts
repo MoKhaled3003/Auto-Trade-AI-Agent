@@ -45,15 +45,31 @@ const TRADE_POLL_MS  = parseInt(process.env.ALPACA_TRADE_POLL_MS ?? '3000',  10)
 const AGGRESSIVE = (process.env.AGGRESSIVE ?? 'false').toLowerCase() === 'true';
 const RECENCY_BARS = AGGRESSIVE ? 50 : 20;
 
+// 🕌 Sharia-compliant mode — long-only spot, no shorting (selling what you don't own),
+// no margin. Default ON because Islamic finance is the assumed baseline.
+const SHARIA_COMPLIANT = (process.env.SHARIA_COMPLIANT ?? 'true').toLowerCase() === 'true';
+
 const candleBuffers   = new Map<string, Candle[]>();
 const backfilled      = new Set<string>();
 const lastSetupKey    = new Map<string, string>();   // anti-spam: per-ticker dedupe
 const lastBlockReason = new Map<string, string>();   // diagnostic: why each ticker is not firing
 
 const broker    = new AlpacaBroker();
-const tracker   = new TradeTracker(MAX_PER_DAY, MAX_CONCUR, broker);
 const portfolio = new PortfolioManager(process.env.PORTFOLIO_FILE ?? './portfolio.json');
 portfolio.load();
+
+// 🕌 If Sharia mode is on, flag any short positions still listed in portfolio.json
+if (SHARIA_COMPLIANT) {
+  // We can't read positions directly, but the load() output will reveal shorts
+  // (every entry prints with ▲ LONG or ▼ SHORT). Add a header so the user sees it.
+  console.log(chalk.gray(
+    '   (Sharia mode: any ▼ SHORT entries above are NOT compatible — ' +
+    'they were opened before this mode was enabled. Close them manually.)'
+  ));
+}
+// Tracker checks portfolio first to avoid opposite-direction submissions
+// that Alpaca would reject (error 40310000).
+const tracker   = new TradeTracker(MAX_PER_DAY, MAX_CONCUR, broker, portfolio);
 
 const news         = new NewsService(TICKERS);
 const fundamentals = new FundamentalsService(TICKERS);
@@ -200,6 +216,13 @@ async function analyse(ticker: string, currentPrice: number): Promise<void> {
     const shortsAllowed = htfBias === 'bearish' &&
                           (structure.bias === 'bearish' || structure.bias === 'ranging');
     direction = longsAllowed ? 'long' : shortsAllowed ? 'short' : null;
+  }
+
+  // 🕌 Sharia gate — block all shorts (selling what you don't own).
+  // Bearish bias becomes "stay out, wait for trend reversal" rather than fade it.
+  if (SHARIA_COMPLIANT && direction === 'short') {
+    lastBlockReason.set(ticker, `🕌 bearish bias — short trades disabled (Sharia mode)`);
+    return;
   }
   if (!direction) {
     lastBlockReason.set(ticker, `bias misaligned (HTF=${htfBias}, LTF=${structure.bias})`);
@@ -431,6 +454,10 @@ async function main(): Promise<void> {
   console.log(`  Mode:         ` +
     (AGGRESSIVE ? chalk.redBright('🔥 AGGRESSIVE') + chalk.gray(' (more trades, lower win rate)')
                 : chalk.greenBright('🛡  CONSERVATIVE') + chalk.gray(' (fewer trades, higher quality)')));
+  console.log(`  Sharia:       ` +
+    (SHARIA_COMPLIANT
+      ? chalk.greenBright('🕌 ON') + chalk.gray('  — long-only spot, no shorting, no margin')
+      : chalk.gray('off — long + short allowed')));
   console.log(`  Max trades:   ${MAX_PER_DAY}/day, ${MAX_CONCUR} concurrent`);
   console.log(`  Sessions:     pre 04:00-09:30 | RTH-prime 10:00-11:30 + 13:00-15:30 | post 16:00-20:00 ET`);
   console.log(`                (RTH uses brackets, ext-hours uses limit + tracker-managed exits)`);
@@ -465,6 +492,9 @@ async function main(): Promise<void> {
   // Stage 2b: news + fundamentals (non-blocking — start refreshing in background)
   news.start().catch(err => logError('NewsService start failed', err));
   fundamentals.start().catch(err => logError('FundamentalsService start failed', err));
+
+  // Stage 2c: portfolio sync from Alpaca (every 30s) — Alpaca is now the source of truth
+  await portfolio.startBrokerSync(broker);
 
   // ── Stage 3: live feed ───────────────────────────────────────────────────
   const onTick = async (raw: RawChartData) => {
@@ -502,6 +532,7 @@ async function main(): Promise<void> {
 
   const shutdown = async () => {
     console.log('\n');
+    portfolio.stopBrokerSync();
     tracker.forceCloseAll('Shutdown');
     tracker.printEodSummary();
     portfolio.printSummary();

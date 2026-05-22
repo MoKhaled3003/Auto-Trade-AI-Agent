@@ -2,6 +2,7 @@ import chalk from 'chalk';
 import { TradingSetup } from './types';
 import { winstonLogger } from './logger';
 import { AlpacaBroker } from './alpaca-broker';
+import { PortfolioManager } from './portfolio';
 
 type Status = 'WATCHING' | 'ENTERED' | 'CLOSED';
 
@@ -41,12 +42,19 @@ export class TradeTracker {
   private maxPerDay: number;
   private maxConcurrent: number;
   private dayKey: string = this._dayKey();
-  private broker: AlpacaBroker | null = null;
+  private broker:    AlpacaBroker | null = null;
+  private portfolio: PortfolioManager | null = null;
 
-  constructor(maxPerDay = 5, maxConcurrent = 2, broker: AlpacaBroker | null = null) {
+  constructor(
+    maxPerDay = 5,
+    maxConcurrent = 2,
+    broker: AlpacaBroker | null = null,
+    portfolio: PortfolioManager | null = null,
+  ) {
     this.maxPerDay     = maxPerDay;
     this.maxConcurrent = maxConcurrent;
     this.broker        = broker;
+    this.portfolio     = portfolio;
   }
 
   // ── Public API ────────────────────────────────────────────────────────────
@@ -57,11 +65,37 @@ export class TradeTracker {
 
     const key = `${setup.ticker}_${setup.direction}_${setup.entry.low.toFixed(2)}_${setup.entry.high.toFixed(2)}`;
 
+    // ── A. Portfolio direction conflict ──────────────────────────────────
+    // Alpaca rejects any short on a ticker you already hold long (and vice versa).
+    // Skip the order entirely so we don't even attempt it.
+    if (this.portfolio) {
+      const held = this.portfolio.positionsFor(setup.ticker);
+      const conflicting = held.find(p => p.direction !== setup.direction);
+      if (conflicting) {
+        console.log(chalk.gray(
+          `  ⏭  [${setup.ticker}] ${setup.direction.toUpperCase()} setup rejected — ` +
+          `portfolio holds ${conflicting.qty}sh ${conflicting.direction.toUpperCase()} ` +
+          `(can't open opposite side on same account)`
+        ));
+        return false;
+      }
+    }
+
+    // ── B. Tracker's own duplicate / debounce ────────────────────────────
     // Already watching/entered this exact setup? Skip silently (debounce).
     const existing = this.positions.get(setup.ticker);
     if (existing && existing.setupKey === key) return false;
 
-    // Already have an open position on this ticker? One at a time.
+    // Already have a tracker-managed position with opposite direction? Conflict.
+    if (existing && existing.status !== 'CLOSED' && existing.direction !== setup.direction) {
+      console.log(chalk.gray(
+        `  ⏭  [${setup.ticker}] ${setup.direction.toUpperCase()} setup rejected — ` +
+        `agent already managing ${existing.direction.toUpperCase()} on this ticker`
+      ));
+      return false;
+    }
+
+    // Already have an open position on this ticker (same direction)? One at a time.
     if (existing && existing.status !== 'CLOSED') {
       console.log(chalk.gray(`  ⏭  [${setup.ticker}] setup rejected — already have an open position on this ticker`));
       return false;
@@ -100,19 +134,9 @@ export class TradeTracker {
 
     this.positions.set(setup.ticker, pos);
     this._logWatching(pos);
-
-    // Hand the setup to Alpaca as a bracket order. Server-side SL/TP are protected
-    // even if our agent crashes. In dry-run mode this just logs intent.
-    if (this.broker?.isReady()) {
-      this.broker.submitBracketOrder({
-        ticker:     pos.ticker,
-        direction:  pos.direction,
-        shares:     pos.shares,
-        entryIdeal: pos.entryIdeal,
-        stopLoss:   pos.stopLoss,
-        takeProfit: pos.takeProfit,
-      }).catch(() => { /* logged by broker */ });
-    }
+    // Broker order is NOT submitted here. We wait until price reaches the entry
+    // zone (see onPrice → status flip to ENTERED) so the bracket TP/SL are valid
+    // against the actual market price at fill time.
     return true;
   }
 
@@ -128,6 +152,20 @@ export class TradeTracker {
         pos.entryPrice = price;
         pos.entryTime  = time;
         this._logEntry(pos);
+
+        // ── Submit the broker order NOW that price is at the entry zone ─────
+        // RTH brackets use market entry → fills at ~current price → TP/SL are
+        // valid because they were sized off the entry zone price.
+        if (this.broker?.isReady()) {
+          this.broker.submitBracketOrder({
+            ticker:     pos.ticker,
+            direction:  pos.direction,
+            shares:     pos.shares,
+            entryIdeal: pos.entryPrice ?? pos.entryIdeal,
+            stopLoss:   pos.stopLoss,
+            takeProfit: pos.takeProfit,
+          }).catch(() => { /* logged by broker */ });
+        }
       }
       return;
     }
